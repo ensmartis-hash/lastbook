@@ -421,10 +421,12 @@ class Setup:
     def state(self):
         self.manifest.fetch_once()
         hw = self.hardware()
+        from engine import hf_cache
         from engine.setup.regions import COUNTRIES
         return {'mode': self.mode, 'hardware': hw, 'manifest': self.manifest.public(), 'current': self.current_info(),
                 'found': self.found(), 'recommend': self.recommend(hw), 'job': self.public_job(),
-                'countries': list(COUNTRIES.values()), 'country': self._settings().get('country')}
+                'countries': list(COUNTRIES.values()), 'cached_models': hf_cache.list_gguf(),
+                'country': self._settings().get('country')}
 
     def public_job(self):
         with self.lock:
@@ -445,9 +447,10 @@ class Setup:
             return p.parent if p.name == DATA_NAME else p
         return self.current.parent if self.current else self.default_parent
 
-    def start(self, pack_id=None, ai=False, folder=None, sources=None, explicit=False, repair=False, map_id=None, address_id=None, country_id=None):
+    def start(self, pack_id=None, ai=False, folder=None, sources=None, explicit=False, repair=False, map_id=None, address_id=None, country_id=None, cached_model=None):
         if repair:
             return self._start_repair(ai)
+        from engine import hf_cache
         from engine.setup.regions import country as country_of
         with self.lock:
             if self.job and self.job['state'] in ACTIVE + ('paused',):
@@ -470,6 +473,11 @@ class Setup:
                     address_id = None
             else:
                 country_id = None
+            cached = hf_cache.describe(cached_model) if cached_model else None
+            if cached_model and not cached:
+                return {'error': 'That file is not a GGUF model in the Hugging Face cache on this computer.', 'code': 'invalid'}
+            if cached:
+                ai = False
             model = self.manifest.model() if ai else None
             if ai and not model:
                 return {'error': 'No local AI is offered for this version.', 'code': 'unavailable'}
@@ -496,9 +504,9 @@ class Setup:
                 model = None       # already here, and an upgrade in place carries it over
             if mp and not pack and cur.get('map') == mp['id']:
                 mp = None          # this state's map is the one here already
-            if self.mode == 'first-run' and not pack and (model or mp or addresses):
+            if self.mode == 'first-run' and not pack and (model or mp or addresses or cached):
                 return {'error': 'Choose a library first.', 'code': 'nothing'}
-            if not pack and not model and not mp and not addresses:
+            if not pack and not model and not mp and not addresses and not cached:
                 if self.mode == 'first-run':
                     return {'error': 'Choose a library first.', 'code': 'nothing'}
                 return {'error': 'Nothing to add: this library and the local AI are already here.', 'code': 'nothing'}
@@ -552,11 +560,14 @@ class Setup:
             if model:
                 items.append({'id': model['id'], 'kind': 'model', 'title': model['title'], 'state': 'waiting', 'bytes_done': 0,
                               'bytes_total': model['size'], 'rate_bps': 0, 'eta_s': None, 'error': None})
+            if cached:
+                items.append({'id': 'cached-model', 'kind': 'cached-model', 'title': cached['title'], 'state': 'waiting', 'bytes_done': 0,
+                              'bytes_total': cached['size'], 'rate_bps': 0, 'eta_s': None, 'error': None})
             self.job = {'id': uuid.uuid4().hex[:12], 'state': 'waiting', 'items': items, 'error': None, 'started': _now(),
                         'folder': str(target),
                         'plan': {'pack': pack, 'model': model, 'map': mp, 'addresses': addresses, 'parent': str(parent), 'target': str(target), 'work': str(work),
                                  'sources': {k: v for k, v in srcs.items() if k in names}, 'explicit': explicit,
-                                 'retried': {}, 'switch': bool(pack), 'country': country_id}}
+                                 'retried': {}, 'switch': bool(pack), 'cached_model': cached, 'country': country_id}}
             s = self._settings()
             s['work'] = str(work)
             if country_id:
@@ -886,6 +897,8 @@ class Setup:
                     self._do_map(it, plan, work, control)
                 elif it['kind'] == 'addresses':
                     self._do_addresses(it, plan, work, control)
+                elif it['kind'] == 'cached-model':
+                    self._do_cached_model(it, plan, work)
                 else:
                     self._do_model(it, plan, work, control)
                 with self.lock:
@@ -1067,6 +1080,39 @@ class Setup:
         for path, ours in got:
             if ours:
                 os.unlink(path)
+
+    def _do_cached_model(self, it, plan, work):
+        """Link a GGUF already in the Hugging Face cache into the library. Nothing is downloaded."""
+        info = plan.get('cached_model') or {}
+        src = Path(info.get('path') or '')
+        if not src.is_file():
+            raise install.Refused('model', 'The cached model file is no longer there.')
+        lib = (work / 'unpack' / DATA_NAME) if plan['switch'] else Path(self.current or plan['target'])
+        if not lib.is_dir():
+            raise install.Refused('model', 'Install a library before choosing a cached model.')
+        dest_dir = lib / 'models'
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        self._set(it, 'activating', bytes_done=info.get('size') or 0, bytes_total=info.get('size') or 0)
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        try:
+            os.symlink(src, dest)
+        except OSError:
+            shutil.copyfile(src, dest)
+        state_path = lib / 'derived' / 'llm' / 'state.json'
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        saved = {}
+        try:
+            saved = json.loads(state_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            saved = {}
+        # After a pack switch, the library is plan['target'], not the unpack folder this file is written in.
+        installed = Path(plan['target']) / 'models' / src.name
+        saved['custom'] = {'path': str(installed), 'size': src.stat().st_size, 'family': info.get('family') or 'chatml',
+                           'name': src.name, 'repo': info.get('repo') or ''}
+        saved['enabled'] = True
+        install._write_json(state_path, saved)
 
     def _do_model(self, it, plan, work, control):
         m = plan['model']
@@ -1306,7 +1352,7 @@ def _default():
 ROUTES = {
     ('GET', 'state'): lambda s, b: s.state(),
     ('GET', 'job'): lambda s, b: s.public_job(),
-    ('POST', 'start'): lambda s, b: s.start(b.get('pack'), bool(b.get('ai')), b.get('folder'), repair=bool(b.get('repair')), map_id=b.get('map') or None, address_id=b.get('address_id') or None, country_id=b.get('country') or None),
+    ('POST', 'start'): lambda s, b: s.start(b.get('pack'), bool(b.get('ai')), b.get('folder'), repair=bool(b.get('repair')), map_id=b.get('map') or None, address_id=b.get('address_id') or None, country_id=b.get('country') or None, cached_model=b.get('cached_model') or None),
     ('POST', 'pause'): lambda s, b: s.pause(),
     ('POST', 'resume'): lambda s, b: s.resume(),
     ('POST', 'cancel'): lambda s, b: s.cancel(),
