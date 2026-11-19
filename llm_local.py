@@ -120,7 +120,8 @@ class Local:
     def status(self):
         with self.lock:
             fit = self.fit or {}
-            return {'name': NAME, 'file': FILE, 'size': SIZE, 'state': self.state, 'pct': self.pct, 'message': self.message,
+            custom = self.saved.get('custom') or {}
+            return {'name': custom.get('name') or NAME, 'file': custom.get('name') or FILE, 'size': custom.get('size') or SIZE, 'state': self.state, 'pct': self.pct, 'message': self.message,
                     'found_at': self.path and _folder_name(self.path), 'enabled': self.enabled(), 'runtime': bool(self.runner),
                     'needs_bytes': fit.get('needs'), 'ram_total': fit.get('ram_total'), 'placement': fit.get('placement'),
                     'load_s': (self.ready_info or {}).get('load_s'), 'places': [_folder_name(p) for p in places()[:6]]}
@@ -155,7 +156,12 @@ class Local:
                 return
             self.state, self.pct, self.message = 'absent', None, ''
         found, wrong = None, None
+        custom = self._custom_file()
+        if custom:
+            found = custom
         for folder in places():
+            if found:
+                break
             p = folder / FILE
             try:
                 if not p.is_file():
@@ -179,6 +185,11 @@ class Local:
                     self.state = 'absent'
             return
         stamp = _stamp(found)
+        if self.saved.get('custom') and Path(self.saved['custom'].get('path', '')) == found:
+            with self.lock:
+                self.path = found
+            self._measure()
+            return
         if self.saved.get('checked') != stamp:
             if not self._check(found):
                 return
@@ -187,6 +198,17 @@ class Local:
         with self.lock:
             self.path = found
         self._measure()
+
+    def _custom_file(self):
+        """A GGUF the person picked from the Hugging Face cache, recorded by setup."""
+        custom = self.saved.get('custom') or {}
+        path = Path(custom.get('path') or '')
+        try:
+            if path.is_file() and path.stat().st_size == custom.get('size'):
+                return path
+        except OSError:
+            return None
+        return None
 
     def _check(self, p):
         with self.lock:
@@ -505,6 +527,36 @@ def declaration(tool):
 
 
 def render(msgs, tools):
+    """Gemma 4 segments for the published model. ChatML for a cached model that is not Gemma."""
+    family = ((LOCAL.saved.get('custom') or {}).get('family'))
+    if family == 'chatml':
+        return render_chatml(msgs, tools)
+    return render_gemma(msgs, tools)
+
+
+def render_chatml(msgs, tools):
+    """ChatML, which the Qwen GGUF files in a typical Hugging Face cache expect."""
+    seg = []
+    for m in msgs:
+        role = 'user' if m['role'] == 'tool' else m['role']
+        if role == 'assistant' and m.get('tool_calls'):
+            calls = []
+            for c in m['tool_calls']:
+                f = c.get('function') or {}
+                calls.append(f.get('name', 'tool') + ' ' + str(f.get('arguments') or ''))
+            text = _text(m).strip()
+            body = (text + '\n' if text else '') + '\n'.join(calls)
+        else:
+            body = _text(m).strip()
+        seg += [['<|im_start|>' + role + '\n', True], [body, False], ['<|im_end|>\n', True]]
+    if tools:
+        names = ', '.join((t.get('function') or {}).get('name', '') for t in tools)
+        seg += [['<|im_start|>system\n', True], ['Tools you may call: ' + names, False], ['<|im_end|>\n', True]]
+    seg.append(['<|im_start|>assistant\n', True])
+    return seg
+
+
+def render_gemma(msgs, tools):
     """OpenAI-shaped messages to Gemma 4 segments, as the model's chat template lays them out, with thinking off.
     System messages before the model's first reply in this turn go together at the top, as the evaluation gave them:
     instructions, then the sources, then the question."""

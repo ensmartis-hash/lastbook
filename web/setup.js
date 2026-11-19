@@ -70,7 +70,7 @@
   /* ------------------------------------------------------------ state */
   let S = null;           // GET state
   let view = 'choose';
-  let choice = { pack: null, ai: false, map: 'SE' };   // map: Sweden, or a US state code
+  let choice = { pack: null, ai: false, map: 'SE', cached: null };   // map: Sweden, or a US state code
   let folder = '';
   let shortfall = null;   // the answer to a start that had no room: {need_bytes, free_bytes}
   let pollT = 0;
@@ -239,6 +239,7 @@
       <h2 id="packH">Library</h2>
       <div class="s-opts" role="radiogroup" aria-labelledby="packH">${packCards}</div>
       ${ai ? `<h2>Local AI</h2>${ai}` : ''}
+      ${cachedPicker()}
       <section class="s-sum" id="sum" aria-live="polite"></section>
       <div class="s-go">
         <button class="btn big" id="start"></button>
@@ -247,7 +248,8 @@
       </div>
       <p class="s-note" id="haveNote" hidden></p>`;
     main.querySelectorAll('input[name=pack]').forEach(r => r.onchange = () => { choice.pack = r.value; shortfall = null; mapSection(); summary() });
-    const box = $('#aiBox'); if (box && !box.disabled) box.onchange = () => { choice.ai = box.checked; shortfall = null; summary() };
+    const box = $('#aiBox'); if (box && !box.disabled) box.onchange = () => { choice.ai = box.checked; if (choice.ai) choice.cached = null; shortfall = null; chooseView() };
+    const cached = $('#cachedSel'); if (cached) cached.onchange = () => { choice.cached = cached.value || null; if (choice.cached) choice.ai = false; shortfall = null; summary() };
     main.querySelectorAll('[data-use]').forEach(b => b.onclick = () => useFile((S.found || [])[+b.dataset.use].path, b));
     $('#start').onclick = start;
     if ($('#toManage')) $('#toManage').onclick = () => go('manage');
@@ -255,6 +257,15 @@
     $('#haveFile').onclick = () => haveLibrary(true);
     mapSection();
     summary();
+  }
+  function cachedPicker() {
+    const rows = (S.cached_models || []);
+    if (!rows.length) return '';
+    const opts = rows.map(m => `<option value="${esc(m.path)}"${choice.cached === m.path ? ' selected' : ''}>${esc(m.title)} — ${size(m.size)}</option>`).join('');
+    return `<h2>Model already on this computer</h2>
+      <label class="s-maplabel" for="cachedSel">Hugging Face cache</label>
+      <select id="cachedSel" class="s-select"><option value="">Download the published Gemma model instead</option>${opts}</select>
+      <p class="s-hint">These are GGUF files already in the Hugging Face cache. Lastbook links the one you pick and does not download a new model. Qwen and other non-Gemma files are prompted in ChatML.</p>`;
   }
   /* Map geometry and address indexes are separate downloads, chosen by country or US state. */
   function mapSection() {
@@ -301,8 +312,8 @@
       ${folderRow()}`
       : `<p class="s-nothing">${c ? 'This is what you have now.' : 'Pick a library.'}</p>${c ? '' : folderRow()}`;
     const b = $('#start');
-    b.disabled = !need || !!short || mapMissing();
-    const newPack = c && packNeedsInstall(packById(choice.pack)), newAi = c && choice.ai && !c.model, newMap = c && !isCountry(choice.map) && mapAdds(), newAddresses = c && !isCountry(choice.map) && addressAdds();
+    b.disabled = (!need && !choice.cached) || !!short || mapMissing();
+    const newPack = c && packNeedsInstall(packById(choice.pack)), newAi = c && choice.ai && !choice.cached && !c.model, newMap = c && !isCountry(choice.map) && mapAdds(), newAddresses = c && !isCountry(choice.map) && addressAdds();
     const parts = [newPack && packById(choice.pack).title, newAi && 'the local AI', newMap && `the ${newMap.title} map`, newAddresses && !newMap && 'offline address search'].filter(Boolean);
     b.textContent = mapMissing() ? 'Choose Sweden or a US state to continue' : !c ? 'Download and install' : parts.length ? 'Get ' + parts.join(parts.length > 2 ? ', ' : ' and ').replace(/, ([^,]*)$/, ' and $1') : 'Nothing to add';
     if (newPack && choice.pack === c.pack && !mapMissing()) b.textContent = 'Download and install update';
@@ -351,7 +362,7 @@
     if (mapMissing()) { $('#mapSel')?.focus(); return }
     const b = $('#start'); b.disabled = true;
     const country = isCountry(choice.map);
-    const r = await call('start', { pack: packNeedsInstall(packById(choice.pack)) ? choice.pack : null, ai: !!choice.ai && aiFits() && !(cur() || {}).model, map: country ? null : (mapAdds() ? choice.map : null), address_id: country ? null : (addressById(selectedState())?.available !== false && addressById(selectedState()) ? selectedState() : null), country: country ? choice.map : null, folder }).catch(e => ({ error: e.message }));
+    const r = await call('start', { pack: packNeedsInstall(packById(choice.pack)) ? choice.pack : null, ai: !!choice.ai && !choice.cached && aiFits() && !(cur() || {}).model, map: country ? null : (mapAdds() ? choice.map : null), address_id: country ? null : (addressById(selectedState())?.available !== false && addressById(selectedState()) ? selectedState() : null), country: country ? choice.map : null, cached_model: choice.cached || null, folder }).catch(e => ({ error: e.message }));
     if (r && r.need_bytes) { shortfall = r; summary(); return }
     if (!r || r.error) { b.disabled = false; const n = $('#haveNote'); n.hidden = false; n.textContent = (r && r.error) || 'Setup could not start.'; return }
     S.job = r; go('job'); poll();
