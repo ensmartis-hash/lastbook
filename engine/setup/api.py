@@ -421,8 +421,10 @@ class Setup:
     def state(self):
         self.manifest.fetch_once()
         hw = self.hardware()
+        from engine.setup.regions import COUNTRIES
         return {'mode': self.mode, 'hardware': hw, 'manifest': self.manifest.public(), 'current': self.current_info(),
-                'found': self.found(), 'recommend': self.recommend(hw), 'job': self.public_job()}
+                'found': self.found(), 'recommend': self.recommend(hw), 'job': self.public_job(),
+                'countries': list(COUNTRIES.values()), 'country': self._settings().get('country')}
 
     def public_job(self):
         with self.lock:
@@ -443,9 +445,10 @@ class Setup:
             return p.parent if p.name == DATA_NAME else p
         return self.current.parent if self.current else self.default_parent
 
-    def start(self, pack_id=None, ai=False, folder=None, sources=None, explicit=False, repair=False, map_id=None, address_id=None):
+    def start(self, pack_id=None, ai=False, folder=None, sources=None, explicit=False, repair=False, map_id=None, address_id=None, country_id=None):
         if repair:
             return self._start_repair(ai)
+        from engine.setup.regions import country as country_of
         with self.lock:
             if self.job and self.job['state'] in ACTIVE + ('paused',):
                 return {'error': 'A download is already under way. Pause or cancel it first.', 'code': 'busy'}
@@ -458,6 +461,15 @@ class Setup:
             same_revision = pack and (not pack.get('revision') or pack['revision'] == cur.get('content_revision', ''))
             if pack and self.mode == 'manage' and cur.get('pack') == pack['id'] and same_revision and not folder:
                 pack = None        # the same library again: only the AI is wanted
+            picked = country_of(country_id) or country_of(map_id)
+            if picked:
+                country_id = picked['id']
+                if map_id == picked['id']:
+                    map_id = None
+                if address_id == picked['id']:
+                    address_id = None
+            else:
+                country_id = None
             model = self.manifest.model() if ai else None
             if ai and not model:
                 return {'error': 'No local AI is offered for this version.', 'code': 'unavailable'}
@@ -544,9 +556,11 @@ class Setup:
                         'folder': str(target),
                         'plan': {'pack': pack, 'model': model, 'map': mp, 'addresses': addresses, 'parent': str(parent), 'target': str(target), 'work': str(work),
                                  'sources': {k: v for k, v in srcs.items() if k in names}, 'explicit': explicit,
-                                 'retried': {}, 'switch': bool(pack)}}
+                                 'retried': {}, 'switch': bool(pack), 'country': country_id}}
             s = self._settings()
             s['work'] = str(work)
+            if country_id:
+                s['country'] = country_id
             self._save_settings(s)
             _tag_sources(self.job)
             self._save_job()
@@ -1292,7 +1306,7 @@ def _default():
 ROUTES = {
     ('GET', 'state'): lambda s, b: s.state(),
     ('GET', 'job'): lambda s, b: s.public_job(),
-    ('POST', 'start'): lambda s, b: s.start(b.get('pack'), bool(b.get('ai')), b.get('folder'), repair=bool(b.get('repair')), map_id=b.get('map') or None, address_id=b.get('address_id') or None),
+    ('POST', 'start'): lambda s, b: s.start(b.get('pack'), bool(b.get('ai')), b.get('folder'), repair=bool(b.get('repair')), map_id=b.get('map') or None, address_id=b.get('address_id') or None, country_id=b.get('country') or None),
     ('POST', 'pause'): lambda s, b: s.pause(),
     ('POST', 'resume'): lambda s, b: s.resume(),
     ('POST', 'cancel'): lambda s, b: s.cancel(),
